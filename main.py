@@ -35,6 +35,17 @@ medians mean-reverts from the checkpoint sum toward n_markets /
 UNIVERSE_N, allocated by price share with approach rate 1-exp(-h/180),
 and shifted values are re-snapped to each market's observed levels.
 
+Small-family path (independent questions, the FAA final's shape): on
+the FAA family's own tape (fetched from Polymarket's public history
+hours after the markets opened, while they repriced violently), the
+persistence-median assumption measurably hurts — those markets trend.
+For cases below MIN_PARTITION_MARKETS this entry therefore keeps half
+of the empirical median offset (drift), widens the spread to 0.80 and
+the tails to 1.6x. On truncated-horizon pseudo cases cut from that
+tape it cut pinball loss by 5-9% versus the partition settings at both
+60 and 120 minutes (see TUNING.md). The partition path above is
+untouched, so practice-family behaviour is unchanged.
+
 Deterministic, stdlib only, no network. Any per-market failure falls
 back to the plain house-baseline forecast for that market, so the
 output shape is always valid.
@@ -75,8 +86,12 @@ UNIVERSE_N = 24
 REV_TAU = 180.0
 # A case with fewer markets than this cannot be a slice of the
 # 24-market partition family this conditioning was tuned on; small
-# families (the FAA final's independent questions) skip it entirely.
+# families (the FAA final's independent questions) skip it entirely
+# and take the small-family parameter set below instead.
 MIN_PARTITION_MARKETS = 8
+SMALL_WIDTH = 0.80
+SMALL_TAU_MUL = [1.6, 1.0, 1.0, 1.0, 1.6]
+SMALL_MED_W = 0.5    # keep this share of the empirical median offset
 
 
 def price6(v):
@@ -114,9 +129,11 @@ def weighted_quantiles(sorted_vals, sorted_w):
     return out
 
 
-def anchor_offsets(prices, regime_scale):
-    """Per-anchor 5 offsets: median-zeroed, width-scaled, per-tau widened,
-    regime-scaled."""
+def anchor_offsets(prices, regime_scale, width=WIDTH, tau_mul=TAU_MUL,
+                   med_w=0.0):
+    """Per-anchor 5 offsets: a med_w share of the empirical median is
+    kept as drift, the rest of the spread is width-scaled and per-tau
+    widened, then regime-scaled."""
     n = len(prices)
     decay = math.exp(math.log(0.5) / HL)
     # powers[i] = decay**i, built once
@@ -139,7 +156,8 @@ def anchor_offsets(prices, regime_scale):
         sw = [p[1] for p in pairs]
         q = weighted_quantiles(sv, sw)
         med = q[2]
-        offs.append([(q[j] - med) * WIDTH * TAU_MUL[j] * regime_scale
+        offs.append([med * med_w
+                     + (q[j] - med) * width * tau_mul[j] * regime_scale
                      for j in range(5)])
     return offs
 
@@ -198,12 +216,16 @@ def interp_rows(offs, horizon):
     return rows
 
 
-def forecast_market(prices, horizon, regime=1.0):
+def forecast_market(prices, horizon, regime=1.0, small_family=False):
     x = prices[-1]
     if len(prices) < 60:
         return baseline_rows(x, horizon)
     levels = sorted(set(prices[-SNAP_WINDOW:]))
-    offs = anchor_offsets(prices[-RECENT:], regime)
+    if small_family:
+        offs = anchor_offsets(prices[-RECENT:], regime, width=SMALL_WIDTH,
+                              tau_mul=SMALL_TAU_MUL, med_w=SMALL_MED_W)
+    else:
+        offs = anchor_offsets(prices[-RECENT:], regime)
     rows = interp_rows(offs, horizon)
     out = []
     for row in rows:
@@ -263,11 +285,13 @@ def main():
             regime = regime_scale(all_prices)
         except Exception:
             regime = 1.0
+        small_family = len(all_prices) < MIN_PARTITION_MARKETS
         all_rows, fallback = [], []
         for mk, prices in zip(case["markets"], all_prices):
             fb = len(prices) < 60
             try:
-                q = forecast_market(prices, horizon, regime)
+                q = forecast_market(prices, horizon, regime,
+                                    small_family=small_family)
             except Exception:
                 q = baseline_rows(prices[-1] if prices else 0.5, horizon)
                 fb = True
